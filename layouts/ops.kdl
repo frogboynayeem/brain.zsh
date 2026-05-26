@@ -1,0 +1,46 @@
+// TERMINAL OS v2.1 — Operations Layout
+// 4-pane: processes, logs, terminal, quick-actions
+//
+// For system monitoring, server operations, debugging
+
+layout {
+    default_cwd "."
+    clear_defaults true
+
+    // Top bar — tabs
+    pane split_direction="vertical" {
+        pane size="2" {
+            plugin location="zellij:tab-bar"
+        }
+
+        // Main split: top row (processes + logs), bottom row (terminal + actions)
+        pane split_direction="horizontal" {
+            // Top row
+            pane split_direction="vertical" {
+                // Processes (btop) — 60%
+                pane size="60%" {
+                    command "bash"
+                    args "-c" "if command -v btop &>/dev/null; then exec btop; else exec htop; fi"
+                }
+                // Logs — 40%
+                pane {
+                    command "bash"
+                    args "-c" "if [ -f /var/log/syslog ]; then exec tail -f /var/log/syslog; elif [ -f /var/log/messages ]; then exec tail -f /var/log/messages; else exec journalctl -f; fi"
+                }
+            }
+
+            // Bottom row
+            pane split_direction="vertical" {
+                // Shell
+                pane size="60%" {
+                    command "zsh"
+                }
+                // Quick actions
+                pane {
+                    command "bash"
+                    args "-c" "echo 'Ops Commands:'; echo '  duf       — Disk usage'; echo '  btop      — System monitor'; echo '  journalctl — Logs'; echo '  ss -tln   — Listening ports'; echo '  df -h     — Disk free'; echo ''; exec zsh"
+                }
+            }
+        }
+    }
+}

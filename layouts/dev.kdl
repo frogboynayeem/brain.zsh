@@ -1,0 +1,46 @@
+// TERMINAL OS v2.1 — Development Layout
+// 3-pane: editor | terminal | git/file browser
+//
+// Usage: zellij --layout dev --session <name>
+//
+// Keybindings:
+//   Alt-n: Next pane
+//   Alt-p: Previous pane
+//   Alt-h/j/k/l: Move between panes (vim)
+//   Alt-[: Collapse pane
+//   Alt-]: Expand pane
+//   Alt-i: Move pane left/down
+//   Alt-o: Move pane right/up
+//   Ctrl-n: New pane (horizontal)
+//   Ctrl-b: New pane (vertical)
+
+layout {
+    // Default to true for 256-color support
+    default_cwd "."
+    clear_defaults true
+
+    // Pane: Editor (nvim) — 60% width on the left
+    pane split_direction="vertical" {
+        pane size="60%" {
+            plugin location="zellij:tab-bar"
+        }
+        pane {
+            // nvim — falls back to zsh if nvim fails
+            command "bash"
+            args "-c" "if command -v nvim &>/dev/null; then exec nvim .; else exec zsh; fi"
+        }
+    }
+
+    // Pane: Right split — terminal on top, git/bottom
+    pane split_direction="vertical" {
+        // Terminal pane (top-right, 50%)
+        pane size="50%" {
+            command "zsh"
+        }
+        // Git or file browser (bottom-right, 50%)
+        pane {
+            command "bash"
+            args "-c" "if command -v lazygit &>/dev/null; then exec lazygit; elif command -v yazi &>/dev/null; then exec yazi; else exec zsh; fi"
+        }
+    }
+}

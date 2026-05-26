@@ -1,0 +1,5 @@
+# No node_modules or build artifacts in a config repo
+sessions/
+*.swp
+*.swo
+.DS_Store

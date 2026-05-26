@@ -1,0 +1,32 @@
+// TERMINAL OS v2.1 — Research Layout
+// 3-pane: notes (vim), browser (w3m/lynx), terminal
+//
+// For reading docs, browsing man pages, taking notes
+
+layout {
+    default_cwd "."
+    clear_defaults true
+
+    pane split_direction="vertical" {
+        pane size="2" {
+            plugin location="zellij:tab-bar"
+        }
+
+        // Editor (left, 40%) — notes
+        pane size="40%" {
+            command "bash"
+            args "-c" "if command -v nvim &>/dev/null; then exec nvim +'set bt=nofile' +'set buftype=log' +'set syntax=markdown' +'normal i# Research Notes'; else exec zsh; fi"
+        }
+
+        // Right split: terminal + browser/reader
+        pane split_direction="vertical" {
+            pane size="60%" {
+                command "zsh"
+            }
+            pane {
+                command "bash"
+                args "-c" "echo 'Research helpers:'; echo '  cheat — lookup command'; echo '  tldr  — quick examples'; echo '  man   — manual'; echo '  navi  — interactive cheatsheets'; echo ''; exec zsh"
+            }
+        }
+    }
+}
