@@ -348,10 +348,11 @@ _brain_ai_load() {
     # Invoke detected AI
     case "$_BRAIN_AI_BIN" in
       opencode)
-        local tmp=$(mktemp /tmp/brain-ai-XXXX)
-        printf '%s' "$full_prompt" > "$tmp"
-        opencode "$tmp"
-        rm -f "$tmp"
+        local args=()
+        [[ -n "$file" && -f "$file" ]] && args+=(--file "$file")
+        [[ -n "$model_flag" ]] && args+=(${=model_flag})
+        # Restore stderr in case brain fix captured it (opencode outputs to stderr)
+        opencode run "${args[@]}" "$full_prompt" 2>&${_BRAIN_STDERR_SAVE:-1}
         ;;
       claude)
         echo "$full_prompt" | claude $model_flag --print -
@@ -824,16 +825,12 @@ _brain_mode_global() {
     _brain_interface_header "ERROR MODE" "$ptype" "$gitstat"
     echo "  Last command failed (exit $exit_code)"
 
-    # Get stderr from last command (fc -l -1 or /dev/stderr)
-    local stderr_file="/tmp/brain-last-stderr-$$.txt"
-    if [[ -f "$stderr_file" ]]; then
-      local stderr=$(cat "$stderr_file")
-      _brain_parse_error "$stderr" "$exit_code"
+    if [[ -n "${_BRAIN_LAST_STDERR:-}" ]]; then
+      _brain_parse_error "$_BRAIN_LAST_STDERR" "$exit_code"
       echo ""
-      _brain_error_fix "$stderr" "$exit_code"
+      _brain_error_fix "$_BRAIN_LAST_STDERR" "$exit_code"
     else
-      echo "  Run a command with brain track to capture errors"
-      echo "  Or use: somecommand 2>/tmp/brain-last-stderr-$$.txt; brain fix"
+      echo "  No captured error. Run a command that fails first."
     fi
     _brain_interface_hr
   }
@@ -854,14 +851,12 @@ _brain_mode_global() {
     _brain_interface_header "ERROR" "$ptype" "$gitstat"
     echo "  Last exit code: $exit_code"
 
-    local stderr_file="/tmp/brain-last-stderr-$$.txt"
-    if [[ -f "$stderr_file" ]]; then
-      local stderr=$(cat "$stderr_file")
-      _brain_parse_error "$stderr" "$exit_code"
+    if [[ -n "${_BRAIN_LAST_STDERR:-}" ]]; then
+      _brain_parse_error "$_BRAIN_LAST_STDERR" "$exit_code"
       echo ""
-      _brain_error_fix "$stderr" "$exit_code"
+      _brain_error_fix "$_BRAIN_LAST_STDERR" "$exit_code"
     else
-      echo "  No captured error. Run a command and check exit code."
+      echo "  No captured error. Run a command that fails first."
     fi
     _brain_interface_hr
   }
@@ -1025,10 +1020,21 @@ _brain_mode_global() {
 # === PREEXEC/PRECMD HOOKS ===
 _brain_preexec() {
   _BRAIN_LAST_PWD="$PWD"
+  # Save stderr fd and redirect to a temp file for brain fix
+  exec {_BRAIN_STDERR_SAVE}>&2
+  _BRAIN_STDERR_FILE=$(mktemp /tmp/brain-stderr-XXXX)
+  exec 2>"$_BRAIN_STDERR_FILE"
 }
 
 _brain_precmd() {
   _BRAIN_LAST_EXIT=$?
+  # Restore stderr and read captured output
+  if [[ -n "${_BRAIN_STDERR_FILE:-}" && -f "$_BRAIN_STDERR_FILE" ]]; then
+    exec 2>&${_BRAIN_STDERR_SAVE:-} 2>/dev/null
+    _BRAIN_LAST_STDERR=$(cat "$_BRAIN_STDERR_FILE" 2>/dev/null)
+    rm -f "$_BRAIN_STDERR_FILE"
+    unset _BRAIN_STDERR_FILE _BRAIN_STDERR_SAVE
+  fi
 
   # Track failures for autonomous mode
   if [[ $_BRAIN_LAST_EXIT -ne 0 ]]; then
