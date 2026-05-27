@@ -33,7 +33,7 @@ _BRAIN_START_TIME=$EPOCHREALTIME 2>/dev/null || _BRAIN_START_TIME=""
 
 # Module loaded flags
 typeset -gA _BRAIN_MODULES
-_BRAIN_MODULES=(detection 0 history 0 navigation 0 git 0 project 0 ai 0 modes 0 interface 0 commands 0)
+_BRAIN_MODULES=(detection 0 history 0 navigation 0 git 0 project 0 ai 0 shoelace 0 modes 0 interface 0 commands 0)
 
 # ── Marker: nothing else runs at source time ───────────────────────────────
 
@@ -454,9 +454,12 @@ _brain_error_load() {
     fi
 
     echo ""
+    _brain_shoelace_suggest "$stderr"
+    echo ""
     echo "  [o] open file in editor"
     echo "  [c] copy error to clipboard"
     echo "  [a] ask AI"
+    echo "  [s] save fix to Shoelace"
     echo -n "  ❯ "
     local action; read -r action
     case "$action" in
@@ -475,7 +478,25 @@ _brain_error_load() {
         ;;
       a|A)
         _brain_ai_load
-        _brain_ai_query "Explain this error and suggest a fix: $stderr"
+        _brain_shoelace_load
+        local response_file
+        response_file=$(mktemp "${TMPDIR:-/tmp}/brain-shoelace-XXXX")
+        _brain_ai_query "Explain this error and suggest a fix: $stderr" | tee "$response_file"
+        echo ""
+        echo -n "  Save this fix to Shoelace? [y/N] "
+        local sf; read -r sf
+        [[ "$sf" == "y" || "$sf" == "Y" ]] && {
+          local fix_text
+          fix_text=$(cat "$response_file" 2>/dev/null | head -c 2000)
+          _brain_shoelace_learn "$stderr" "$fix_text" "$exit_code"
+        }
+        rm -f "$response_file"
+        ;;
+      s|S)
+        _brain_shoelace_load
+        echo -n "  Type the fix that worked: "
+        local fix_text; read -r fix_text
+        [[ -n "$fix_text" ]] && _brain_shoelace_learn "$stderr" "$fix_text" "$exit_code" || echo "  Cancelled"
         ;;
     esac
   }
@@ -503,6 +524,256 @@ _brain_error_load() {
         ;;
     esac
   }
+}
+
+# === SHOELACE — Persistent Failure Knowledge Base ===
+_brain_shoelace_load() {
+  [[ ${_BRAIN_MODULES[shoelace]} -eq 1 ]] && return
+  _BRAIN_MODULES[shoelace]=1
+  _brain_detection_load
+  _brain_interface_load
+
+  _brain_has sqlite3 || { _BRAIN_SHOELACE_AVAIL=0; return; }
+  _BRAIN_SHOELACE_AVAIL=1
+  _BRAIN_SHOELACE_DB="${XDG_DATA_HOME:-$HOME/.local/share}/brain/shoelace.db"
+
+  [[ -f "$_BRAIN_SHOELACE_DB" ]] && return
+  mkdir -p "$(dirname "$_BRAIN_SHOELACE_DB")"
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    CREATE TABLE IF NOT EXISTS errors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fingerprint TEXT NOT NULL UNIQUE,
+      error_snippet TEXT NOT NULL,
+      exit_code INTEGER,
+      last_command TEXT,
+      last_cwd TEXT,
+      seen_count INTEGER DEFAULT 1,
+      first_seen TEXT DEFAULT (datetime('now')),
+      last_seen TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS fixes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      error_id INTEGER NOT NULL,
+      fix_text TEXT NOT NULL,
+      success_count INTEGER DEFAULT 0,
+      fail_count INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (error_id) REFERENCES errors(id)
+    );
+  "
+}
+
+_brain_shoelace_escape() {
+  echo "$1" | sed "s/'/''/g"
+}
+
+_brain_shoelace_hash() {
+  local raw="$1"
+  local norm
+  norm=$(echo "$raw" | sed -E '
+    s/[0-9]+/#/g
+    s/0x[0-9a-fA-F]+/#/g
+    s|/[^ ]*[a-zA-Z]/[^ ]*|/path|g
+  ' | head -c 500)
+  if _brain_has sha256sum; then
+    echo "$norm" | sha256sum | cut -d' ' -f1
+  elif _brain_has md5sum; then
+    echo "$norm" | md5sum | cut -d' ' -f1
+  else
+    echo "${#norm}"
+  fi
+}
+
+_brain_shoelace_find() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && return
+  local fp=$(_brain_shoelace_hash "$1")
+  sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+    SELECT f.fix_text, f.success_count, f.fail_count, e.seen_count
+    FROM errors e
+    JOIN fixes f ON f.error_id = e.id
+    WHERE e.fingerprint = '$fp'
+    ORDER BY f.success_count DESC, f.fail_count ASC
+    LIMIT 1;
+  " 2>/dev/null
+}
+
+_brain_shoelace_record_error() {
+  local error_text="$1" exit_code="$2" cmd="$3"
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && return
+  local fp=$(_brain_shoelace_hash "$error_text")
+  local err_esc=$(_brain_shoelace_escape "$(echo "$error_text" | head -c 500)")
+  local cmd_esc=$(_brain_shoelace_escape "$(echo "$cmd" | head -c 200)")
+  local cwd_esc=$(_brain_shoelace_escape "$PWD")
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    INSERT INTO errors (fingerprint, error_snippet, exit_code, last_command, last_cwd)
+    VALUES ('$fp', '$err_esc', $exit_code, '$cmd_esc', '$cwd_esc')
+    ON CONFLICT(fingerprint) DO UPDATE SET
+      seen_count = seen_count + 1,
+      last_seen = datetime('now'),
+      last_command = excluded.last_command,
+      last_cwd = excluded.last_cwd;
+  " 2>/dev/null
+}
+
+_brain_shoelace_learn() {
+  local error_text="$1" fix_text="$2" exit_code="${3:-}"
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  local fp=$(_brain_shoelace_hash "$error_text")
+  local err_esc=$(_brain_shoelace_escape "$(echo "$error_text" | head -c 500)")
+  local fix_esc=$(_brain_shoelace_escape "$(echo "$fix_text" | head -c 2000)")
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    INSERT INTO errors (fingerprint, error_snippet${exit_code:+, exit_code})
+    VALUES ('$fp', '$err_esc'${exit_code:+, $exit_code})
+    ON CONFLICT(fingerprint) DO UPDATE SET
+      seen_count = seen_count + 1,
+      last_seen = datetime('now');
+  " 2>/dev/null
+  local error_id
+  error_id=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT id FROM errors WHERE fingerprint = '$fp';" 2>/dev/null)
+  [[ -z "$error_id" ]] && { echo "  ✗ Failed to save"; return; }
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    INSERT INTO fixes (error_id, fix_text) VALUES ($error_id, '$fix_esc');
+  " 2>/dev/null && echo "  ✓ Saved to Shoelace" || echo "  ✗ Failed to save fix"
+}
+
+_brain_shoelace_suggest() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && return
+  local error_text="$1"
+  [[ -z "$error_text" ]] && return
+  local result
+  result=$(_brain_shoelace_find "$error_text")
+  [[ -z "$result" ]] && return
+  local fields=("${(s:|:)result}")
+  echo "  ${_BRAIN_CYAN}🧠 SHOELACE${_BRAIN_RESET} Known fix available:"
+  echo "    ${fields[1]}"
+  local total=$(( ${fields[2]:-0} + ${fields[3]:-0} ))
+  if [[ $total -gt 0 ]]; then
+    local pct=$(( fields[2] * 100 / total ))
+    echo "    ${_BRAIN_DIM}Success: ${pct}% (${fields[2]}/${total}) | Seen: ${fields[4]}x${_BRAIN_RESET}"
+  fi
+  echo "    ${_BRAIN_DIM}Run: brain shoelace apply${_BRAIN_RESET}"
+}
+
+_brain_shoelace_apply_fix() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && return
+  local error_text="$1"
+  local result
+  result=$(_brain_shoelace_find "$error_text")
+  [[ -z "$result" ]] && { echo "  ✗ No known fix"; return; }
+  local fields=("${(s:|:)result}")
+  local fix="${fields[1]}"
+  echo "  Applying: $fix"
+  eval "$fix"
+}
+
+_brain_shoelace_stats() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  _brain_interface_load
+  _brain_interface_header "SHOELACE STATS"
+  local counts
+  counts=$(sqlite3 "$_BRAIN_SHOELACE_DB" "
+    SELECT
+      (SELECT COUNT(*) FROM errors) AS total_errors,
+      (SELECT COUNT(*) FROM fixes) AS total_fixes,
+      COALESCE((SELECT SUM(seen_count) FROM errors), 0) AS total_seen,
+      COALESCE((SELECT SUM(success_count) FROM fixes), 0) AS total_success,
+      COALESCE((SELECT SUM(fail_count) FROM fixes), 0) AS total_fail;
+  " 2>/dev/null)
+  if [[ -n "$counts" ]]; then
+    local fields=("${(s:|:)counts}")
+    echo "  Unique errors:    ${fields[1]}"
+    echo "  Saved fixes:      ${fields[2]}"
+    echo "  Total occurrences:${fields[3]}"
+    echo "  Fix successes:    ${fields[4]}"
+    echo "  Fix failures:     ${fields[5]}"
+    local total=$(( ${fields[4]:-0} + ${fields[5]:-0} ))
+    if [[ $total -gt 0 ]]; then
+      local pct=$(( fields[4] * 100 / total ))
+      echo "  Overall rate:     ${pct}% success"
+    fi
+  fi
+  _brain_interface_hr
+}
+
+_brain_shoelace_list() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  _brain_interface_load
+  _brain_interface_header "SHOELACE ERRORS"
+  local rows
+  rows=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+    SELECT e.id, e.seen_count,
+           replace(substr(coalesce(e.error_snippet, ''), 1, 60), char(10), ' '),
+           coalesce(f.success_count, 0), coalesce(f.fail_count, 0)
+    FROM errors e
+    LEFT JOIN fixes f ON f.error_id = e.id
+    ORDER BY e.last_seen DESC
+    LIMIT 20;
+  " 2>/dev/null)
+  if [[ -z "$rows" ]]; then
+    echo "  No errors recorded yet"
+  else
+    echo "$rows" | while IFS='|' read -r id seen snippet suc fail; do
+      echo "  #$id | seen ${seen}x | ${snippet}"
+    done
+  fi
+  _brain_interface_hr
+}
+
+_brain_shoelace_forget() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  local id="$1"
+  if [[ -z "$id" ]]; then
+    echo "  Usage: brain shoelace forget <id>"
+    echo "  Find IDs with: brain shoelace list"
+    return
+  fi
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    DELETE FROM fixes WHERE error_id = $id;
+    DELETE FROM errors WHERE id = $id;
+  " 2>/dev/null && echo "  ✓ Removed #$id" || echo "  ✗ Not found"
+}
+
+_brain_shoelace_clear() {
+  _brain_shoelace_load
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  echo -n "  Clear all Shoelace data? [y/N] "
+  local resp; read -r resp
+  [[ "$resp" != "y" && "$resp" != "Y" ]] && { echo "  Cancelled"; return; }
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    DELETE FROM fixes;
+    DELETE FROM errors;
+  " 2>/dev/null && echo "  ✓ Cleared" || echo "  ✗ Failed"
+}
+
+_brain_shoelace_cmd() {
+  _brain_shoelace_load
+  local action="${1:-stats}"
+  shift 2>/dev/null || true
+  case "$action" in
+    stats|status)  _brain_shoelace_stats ;;
+    list|ls)       _brain_shoelace_list ;;
+    forget|rm)     _brain_shoelace_forget "$1" ;;
+    clear)         _brain_shoelace_clear ;;
+    apply)         _brain_shoelace_apply_fix "${_BRAIN_LAST_STDERR:-}" ;;
+    learn)
+      local fix_text="$1"
+      [[ -z "$fix_text" ]] && { echo "  Usage: brain shoelace learn <fix command>"; return; }
+      _brain_shoelace_learn "${_BRAIN_LAST_STDERR:-}" "$fix_text" "$_BRAIN_LAST_EXIT"
+      ;;
+    *)
+      echo "  brain shoelace: unknown action"
+      echo "  Usage: brain shoelace [stats|list|forget <id>|clear|apply|learn <fix>]"
+      ;;
+  esac
 }
 
 # === PLUGINS ===
@@ -629,6 +900,9 @@ brain() {
       _brain_history_load
       _brain_history_search "$@"
       ;;
+    shoelace)
+      _brain_shoelace_cmd "$@"
+      ;;
     session)
       _brain_mode_session "$@"
       ;;
@@ -743,6 +1017,18 @@ _brain_doctor() {
     local cache_size=0
     [[ -f "$_BRAIN_CACHE_FILE" ]] && cache_size=$(wc -l < "$_BRAIN_CACHE_FILE" 2>/dev/null)
     echo "  Persistent file: ${cache_size} entries"
+    echo ""
+    echo ""
+    echo "  ── Shoelace ──"
+    _brain_shoelace_load 2>/dev/null
+    if _brain_has sqlite3 && [[ -f "${_BRAIN_SHOELACE_DB:-}" ]]; then
+      local sc
+      sc=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT COUNT(*) FROM errors;" 2>/dev/null)
+      echo "  Errors tracked: ${sc:-0}"
+      printf "  %-16s %s\n" "DB" "$_BRAIN_SHOELACE_DB"
+    else
+      echo "  Not available (install sqlite3)"
+    fi
   }
 
   # ── Help ─────────────────────────────────────────────────────────────────
@@ -757,6 +1043,7 @@ _brain_doctor() {
     printf "  %-10s  %s\n" "brain files" "File browser"
     printf "  %-10s  %s\n" "brain history" "History search"
     printf "  %-10s  %s\n" "brain session" "Session manager (list/new/attach/kill)"
+    printf "  %-10s  %s\n" "brain shoelace" "Error knowledge base (stats/list/learn)"
     printf "  %-10s  %s\n" "brain jump" "Directory jump"
     printf "  %-10s  %s\n" "brain doctor" "Check all tools"
     printf "  %-10s  %s\n" "brain cache" "Clear project cache"
@@ -1022,7 +1309,7 @@ _brain_preexec() {
   _BRAIN_LAST_PWD="$PWD"
   # Save stderr fd and redirect to a temp file for brain fix
   exec {_BRAIN_STDERR_SAVE}>&2
-  _BRAIN_STDERR_FILE=$(mktemp /tmp/brain-stderr-XXXX)
+  _BRAIN_STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/brain-stderr-XXXX")
   exec 2>"$_BRAIN_STDERR_FILE"
 }
 
@@ -1040,6 +1327,24 @@ _brain_precmd() {
   if [[ $_BRAIN_LAST_EXIT -ne 0 ]]; then
     _BRAIN_FAIL_COUNT[$PWD]=$(( _BRAIN_FAIL_COUNT[$PWD] + 1 ))
     _BRAIN_FAIL_EXIT[$PWD]=$_BRAIN_LAST_EXIT
+    # Proactive Shoelace suggestion on repeated failure
+    if [[ ${_BRAIN_FAIL_COUNT[$PWD]} -eq 3 && -n "${_BRAIN_LAST_STDERR:-}" ]]; then
+      _brain_shoelace_load
+      local sl_result
+      sl_result=$(_brain_shoelace_find "$_BRAIN_LAST_STDERR")
+      if [[ -n "$sl_result" ]]; then
+        local sl_fields=("${(s:|:)sl_result}")
+        echo ""
+        echo "  ${_BRAIN_CYAN}🧠 SHOELACE${_BRAIN_RESET} Repeating error — known fix:"
+        echo "    ${_BRAIN_GREEN}→${_BRAIN_RESET} ${sl_fields[1]}"
+        local total=$(( ${sl_fields[2]:-0} + ${sl_fields[3]:-0} ))
+        [[ $total -gt 0 ]] && {
+          local pct=$(( sl_fields[2] * 100 / total ))
+          echo "    ${_BRAIN_DIM}Success: ${pct}% (${sl_fields[2]}/${total}) | Run: brain shoelace apply${_BRAIN_RESET}"
+        }
+        echo ""
+      fi
+    fi
   else
     _BRAIN_FAIL_COUNT[$PWD]=0
   fi
