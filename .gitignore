@@ -1,5 +1,30 @@
-# No node_modules or build artifacts in a config repo
-sessions/
+# OS files
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
-.DS_Store
+*~
+
+# Session state (user-specific, not shared)
+sessions/
+
+# IDE/editor
+.vscode/
+.idea/
+*.sublime-*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Node
+node_modules/
+
+# Rust
+target/
+
+# Shell history/completions
+.zcompdump*
+*.zwc

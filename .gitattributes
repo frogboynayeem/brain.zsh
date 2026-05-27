@@ -1,0 +1,20 @@
+* text=auto eol=lf
+
+# Shell scripts
+*.zsh text
+*.sh text
+*.bash text
+
+# Config files
+*.conf text
+*.kdl text
+*.rules text
+
+# Docs
+*.md text
+*.txt text
+
+# Binary
+*.png binary
+*.jpg binary
+*.ico binary

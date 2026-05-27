@@ -20,13 +20,14 @@ Single-file Zsh dispatcher with lazy-loaded modules. It detects your project, ro
 - **Project detection** — Node, Rust, Python, Go, Docker, git. Cached persistently across terminal restarts.
 - **AI routing** — Builds rich context (project type, branch, git log, file tree, last command) and routes it to opencode, claude, or llm.
 - **Error parsing** — Rust, Python, JS/TS, Go, and shell errors (`command not found`, `permission denied`, `syntax error`) with suggestions.
+- **Auto-capture stderr** — Every command's stderr is saved automatically. `brain fix` works without manual piping.
 - **Session manager** — `brain session new/attach/kill` for zellij and tmux.
 - **Persistent cache** — `~/.cache/brain/projects` survives terminal restarts. Zero re-scan.
 - **Plugin system** — `brain plugin list/load` scans `~/.config/brain/plugins/`.
 - **Autonomous mode** — After 3 identical failures, suggests and optionally runs auto-fixes.
 - **Tool degradation** — Every tool has a fallback chain. Never crashes on missing deps.
 - **zsh-autocomplete** — Fish-style type-ahead completion (Marlon Richert, v25.03.19).
-- **8ms source time** — Everything is lazy-loaded. Nothing runs until you call `brain`.
+- **~30ms source time** — Everything is lazy-loaded. Nothing runs until you call `brain`.
 
 ## Usage
 
@@ -46,7 +47,7 @@ brain cache   # clear project cache
 ## Architecture
 
 ```
-brain.zsh (1,058 lines)
+brain.zsh (~1,070 lines)
 ├── Bootstrap          — version guard, cache vars, module flags
 ├── Detection          — OS, arch, tool availability
 ├── History            — atuin / fc integration
