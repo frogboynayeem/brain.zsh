@@ -29,11 +29,34 @@ Single-file Zsh dispatcher with lazy-loaded modules. It detects your project, ro
 - **zsh-autocomplete** — Fish-style type-ahead completion (Marlon Richert, v25.03.19).
 - **~30ms source time** — Everything is lazy-loaded. Nothing runs until you call `brain`.
 
+## Install
+
+### curl | bash (recommended)
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/frogboynayeem/brain.zsh/main/install.sh)
+```
+
+### Homebrew
+
+```sh
+brew tap frogboynayeem/brain
+brew install brain-zsh
+# then add to ~/.zshrc: source "$(brew --prefix)/share/brain.zsh/brain.zsh"
+```
+
+### Manual
+
+```sh
+git clone https://github.com/frogboynayeem/brain.zsh.git ~/.config/terminal-os
+echo 'source ~/.config/terminal-os/brain.zsh' >> ~/.zshrc
+source ~/.zshrc
+```
+
 ## Usage
 
 ```zsh
-source /path/to/brain.zsh
-export BRAIN_AI_MODEL=opencode/claude-haiku-4-5  # optional
+export BRAIN_AI_MODEL=provider/model  # optional, e.g. openrouter/hermes-3-llama-3.1-70b
 
 brain         # auto-detect: global or project mode
 brain ai      # AI assistant with context
@@ -70,7 +93,9 @@ brain.zsh (~1,070 lines)
 ~/.config/terminal-os/
 ├── brain.zsh           ← the brain (source this)
 ├── terminal-os.zsh     ← wrapper / legacy compat
+├── install.sh          ← curl | bash installer
 ├── uninstall.sh        ← clean removal
+├── Formula/            ← Homebrew formula
 ├── core/               ← detect, hooks, init, session
 ├── ai/                 ← router
 ├── layouts/            ← zellij layouts (dev, ops, research)
