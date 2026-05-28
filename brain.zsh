@@ -9,7 +9,7 @@
 # ============================================================================
 
 # === BOOTSTRAP ===
-[[ -n $_BRAIN_BOOTSTRAP_LOADED ]] && return
+[[ -n ${_BRAIN_BOOTSTRAP_LOADED:-} ]] && return
 _BRAIN_BOOTSTRAP_LOADED=1
 
 # Version guard: zsh 5.3+ for associative arrays
@@ -29,7 +29,9 @@ _BRAIN_LAST_PWD=""
 _BRAIN_AI_BIN=""
 _BRAIN_AI_MODEL=""
 _BRAIN_CACHE_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/brain/projects"
-_BRAIN_START_TIME=$EPOCHREALTIME 2>/dev/null || _BRAIN_START_TIME=""
+_BRAIN_START_TIME=${EPOCHREALTIME:-} 2>/dev/null || _BRAIN_START_TIME=""
+_BRAIN_SHOELACE_ERR=""
+_BRAIN_SHOELACE_SESSION_ID=""
 
 # Module loaded flags
 typeset -gA _BRAIN_MODULES
@@ -547,17 +549,57 @@ _brain_error_load() {
 
 # ── Module loader + schema migration ──────────────────────────────────────
 _brain_shoelace_load() {
-  [[ ${_BRAIN_MODULES[shoelace]} -eq 1 ]] && return
+  [[ ${_BRAIN_MODULES[shoelace]:-0} -eq 1 ]] && return
   _BRAIN_MODULES[shoelace]=1
   _brain_detection_load
   _brain_interface_load
 
-  _brain_has sqlite3 || { _BRAIN_SHOELACE_AVAIL=0; return; }
-  _BRAIN_SHOELACE_AVAIL=1
+  # Health check 1: sqlite3 binary
+  _brain_has sqlite3 || {
+    _BRAIN_SHOELACE_AVAIL=0
+    _BRAIN_SHOELACE_ERR="sqlite3 not found in PATH"
+    return
+  }
+
   [[ -z "$_BRAIN_SHOELACE_DB" ]] && _BRAIN_SHOELACE_DB="${XDG_DATA_HOME:-$HOME/.local/share}/brain/shoelace.db"
 
-  mkdir -p "$(dirname "$_BRAIN_SHOELACE_DB")"
+  local dbdir
+  dbdir=$(dirname "$_BRAIN_SHOELACE_DB")
+
+  # Health check 2: DB directory writable
+  if ! mkdir -p "$dbdir" 2>/dev/null; then
+    _BRAIN_SHOELACE_AVAIL=0
+    _BRAIN_SHOELACE_ERR="cannot create DB directory: $dbdir"
+    return
+  fi
+
+  if ! [[ -w "$dbdir" ]]; then
+    _BRAIN_SHOELACE_AVAIL=0
+    _BRAIN_SHOELACE_ERR="DB directory not writable: $dbdir"
+    return
+  fi
+
   _brain_shoelace_migrate
+
+  # Health check 3: DB integrity (only if file exists)
+  if [[ -f "$_BRAIN_SHOELACE_DB" ]]; then
+    local integ
+    integ=$(sqlite3 -cmd ".timeout 5000" "$_BRAIN_SHOELACE_DB" "PRAGMA quick_check;" 2>&1)
+    if [[ "$integ" != "ok" ]]; then
+      # "database is locked" is transient, not corruption
+      if [[ "$integ" == *"locked"* ]]; then
+        _BRAIN_SHOELACE_AVAIL=1
+        _BRAIN_SHOELACE_ERR=""
+      else
+        _BRAIN_SHOELACE_AVAIL=0
+        _BRAIN_SHOELACE_ERR="corruption detected: $integ"
+        return
+      fi
+    fi
+  fi
+
+  _BRAIN_SHOELACE_AVAIL=1
+  _BRAIN_SHOELACE_ERR=""
 }
 
 _brain_shoelace_migrate() {
@@ -568,6 +610,19 @@ _brain_shoelace_migrate() {
   if [[ $ver -lt 1 ]]; then
     _brain_shoelace_migrate_v1
   fi
+  if [[ $ver -lt 2 ]]; then
+    _brain_shoelace_migrate_v2
+  fi
+}
+
+_brain_shoelace_migrate_v2() {
+  # V2: Production hardening — WAL mode, synchronous, durability
+  sqlite3 "$_BRAIN_SHOELACE_DB" "PRAGMA journal_mode=WAL;" 2>/dev/null
+  sqlite3 "$_BRAIN_SHOELACE_DB" "PRAGMA synchronous=NORMAL;" 2>/dev/null
+  sqlite3 "$_BRAIN_SHOELACE_DB" "
+    INSERT OR IGNORE INTO schema_version (version, description)
+    VALUES (2, 'v2 hardening: WAL mode, synchronous=NORMAL');
+  " 2>/dev/null
 }
 
 _brain_shoelace_migrate_v1() {
@@ -681,6 +736,48 @@ _brain_shoelace_escape() {
   printf '%s' "$1" | tr -d '\000' | sed "s/'/''/g"
 }
 
+# ── SQLite helper: safe write execution with retry ────────────────────────
+# Every invocation is a fresh sqlite3 process. We MUST set per-connection
+# PRAGMAs and use retry with backoff for concurrent write safety.
+_brain_shoelace_db() {
+  local sql="$1" db="${2:-$_BRAIN_SHOELACE_DB}"
+  local retries="${3:-5}" sleep_base="${4:-50}"
+  local attempt=0 result rc
+
+  while (( attempt++ < retries )); do
+    # synchronous=NORMAL must be set per-connection (WAL journal_mode is persistent)
+    # PRAGMA assignments via echo pipe produce no output (unlike -cmd)
+    result=$(echo "PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; $sql" | \
+      sqlite3 -separator '|' -cmd ".timeout 5000" "$db" 2>&1)
+    rc=$?
+    [[ $rc -eq 0 ]] && { printf '%s' "$result"; return 0; }
+    # Only retry on lock-contention errors, not syntax/constraint failures
+    if [[ "$result" == *"database is locked"* ]] || \
+       [[ "$result" == *"BUSY"* ]] || \
+       [[ "$result" == *"cannot commit"* ]] || \
+       [[ "$result" == *"locking protocol"* ]]; then
+      sleep 0.$(( attempt * sleep_base ))
+      continue
+    fi
+    return $rc
+  done
+  return 1
+}
+
+_brain_shoelace_db_write() {
+  local sql="$1" db="${2:-$_BRAIN_SHOELACE_DB}" retries="${3:-5}"
+  local attempt=0 rc
+
+  while (( attempt++ < retries )); do
+    echo "PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE; $sql; COMMIT;" | \
+      sqlite3 -cmd ".timeout 5000" "$db" 2>/dev/null
+    rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    sleep 0.$(( attempt * 100 ))
+  done
+  return $rc
+}
+
 # ── Error Normalization Engine ────────────────────────────────────────────
 # Transforms raw stderr into a stable, matchable form by replacing volatile
 # identifiers with placeholders. Each normalization has a specific rationale.
@@ -710,15 +807,23 @@ _brain_shoelace_normalize_exact() {
   local raw="$1"
   # Truncate to prevent DoS on enormous stderr
   raw=$(printf '%s' "$raw" | head -c 5000)
+  # Strip ANSI escape sequences using literal ESC byte (GNU sed doesn't support \x1b)
+  raw=$(printf '%s' "$raw" | sed -E '
+    s/'$(printf '\033')'\[[0-9;?]*[a-zA-Z]//g
+    s/'$(printf '\033')'\][^'$(printf '\033')']*('$(printf '\033')'\\|$)//g
+    s/'$(printf '\033')'[[()][0-9;?]*[a-zA-Z]?//g
+    s/'$(printf '\033')'[NO]//g
+    s/\\033\[[0-9;?]*[a-zA-Z]//g
+    s/\\033\][^\\033]*(\\033\\|$)//g
+  ')
   printf '%s' "$raw" | sed -E '
     # Order matters: apply most specific patterns first
-
-    # 1. Container IDs: 64-char hex after "container" or sha256:
-    s/\b[0-9a-f]{64}\b/<CID>/g
-    # 2. Short hex hashes (git, docker)
-    s/\b[0-9a-f]{7,40}\b/<HEX>/g
-    # 3. UUIDs: 8-4-4-4-12 format
+    # 1. UUIDs: 8-4-4-4-12 format (MUST come before hex — UUID hex segments match hex patterns)
     s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<UUID>/gi
+    # 2. Container IDs: 64-char hex after "container" or sha256:
+    s/\b[0-9a-f]{64}\b/<CID>/g
+    # 3. Short hex hashes (git, docker)
+    s/\b[0-9a-f]{7,40}\b/<HEX>/g
     # 4. IP addresses: IPv4 and IPv6
     s/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/<IP>/g
     s/[0-9a-f:]+:[0-9a-f:]+:[0-9a-f:]+/<IP>/gi
@@ -730,30 +835,32 @@ _brain_shoelace_normalize_exact() {
     # 7. Temp directories
     s|/tmp/[a-zA-Z0-9._-]+|/tmp/<TMP>|g
     s|/var/tmp/[a-zA-Z0-9._-]+|/var/tmp/<TMP>|g
-    # 8. File paths starting with / (preserve extension)
-    s|/[^ \t\n:()<>"'"'"']*/([^/ \t\n:()<>"'"'"']+\.[a-zA-Z0-9]+)|/<PATH>/\1|g
-    s|/[^ \t\n:()<>"'"'"']+/([^/ \t\n:()<>"'"'"']+)|/<PATH>/\1|g
-    s|/[^ \t\n:()<>"'"'"']+\.[a-zA-Z]{1,4}|/<PATH>.ext|g
-    # 9. Line:column references (Rust, Python, JS, etc.)
+    # 8. Line:column references (Rust, Python, JS, etc.) — before path rules
     s/:[0-9]+:[0-9]+[^0-9]/:<N>:<N> /g
     s/:[0-9]+:[0-9]+$/:<N>:<N>/g
     s/ line [0-9]+/ line <N>/gi
     s/ at line [0-9]+/ at line <N>/gi
-    # 10. Version numbers (semver-like)
+    # 9. dir/file.ext:N — path with line number (MUST come before bare path rules)
+    s/\b[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}:[0-9]+/<PATH>:<N>/g
+    # 9b. Bare filename:line references (no directory) — main.rs:42, foo.py:18
+    s/\b[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}:[0-9]+/<FILE>.ext:<N>/g
+    # 10. Absolute file paths starting with /
+    s|/[^ \t\n:()<>"'"'"']*/([^/ \t\n:()<>"'"'"']+\.[a-zA-Z0-9]+)|/<PATH>/\1|g
+    s|/[^ \t\n:()<>"'"'"']+/([^/ \t\n:()<>"'"'"']+)|/<PATH>/\1|g
+    s|/[^ \t\n:()<>"'"'"']+\.[a-zA-Z]{1,4}|/<PATH>.ext|g
+    # 11. Relative file paths with extensions (src/main.rs, lib/foo.py)
+    s/\b[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}\b/<PATH>/g
+    # 12. Version numbers (semver-like)
     s/[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9._-]*/<VER>/g
     s/v[0-9]+\.[0-9]+\.[0-9]+/v<VER>/g
     s/\bv[0-9]+\b/v<VER>/g
-    # 11. Timestamps: ISO 8601, log timestamps
+    # 13. Timestamps: ISO 8601, log timestamps
     s/[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}/<TS>/g
-    # 12. Process IDs
+    # 14. Process IDs
     s/pid [0-9]+/pid <PID>/gi
     s/PID [0-9]+/PID <PID>/g
-    # 13. Error codes with numbers: E0308, ENOENT, 0x1 etc.
+    # 15. Error codes with numbers: E0308, ENOENT, 0x1 etc.
     s/error\[E[0-9]+\]/error[E<N>]/g
-    # 14. file:line references (single number, no column) — must come before bare paths
-    s/\b[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}:[0-9]+/<PATH>:<N>/g
-    # 15. Relative file paths with extensions (src/main.rs, lib/foo.py)
-    s/\b[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}\b/<PATH>/g
     # 16. Single-quoted strings >3 chars (variable values)
     s/'"'"'[a-zA-Z0-9._/-]{4,}'"'"'/<STR>/g
     # 17. Double-quoted strings >3 chars
@@ -772,8 +879,17 @@ _brain_shoelace_normalize_fuzzy() {
   # Used as fallback when exact match fails
   local raw="$1"
   raw=$(printf '%s' "$raw" | head -c 2000)
+  # Strip ANSI escape sequences  
+  raw=$(printf '%s' "$raw" | sed -E '
+    s/'$(printf '\033')'\[[0-9;?]*[a-zA-Z]//g
+    s/'$(printf '\033')'\][^'$(printf '\033')']*('$(printf '\033')'\\|$)//g
+    s/'$(printf '\033')'[[()][0-9;?]*[a-zA-Z]?//g
+    s/'$(printf '\033')'[NO]//g
+    s/\\033\[[0-9;?]*[a-zA-Z]//g
+    s/\\033\][^\\033]*(\\033\\|$)//g
+  ')
   printf '%s' "$raw" | sed -E '
-    # UUIDs + hex hashes (these vary too much to ever match)
+    # UUIDs (before hex — same UUID must normalize identically)
     s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<UUID>/gi
     s/\b[0-9a-f]{40}\b/<HASH>/g
     # Home and temp dirs
@@ -784,6 +900,8 @@ _brain_shoelace_normalize_fuzzy() {
     s/ line [0-9]+/ line <N>/gi
     # file:line references (single number) — must come before bare paths
     s|\b[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}:[0-9]+|<PATH>:<N>|g
+    # Bare filename:line references (no directory) — main.rs:42, foo.py:18
+    s|\b[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}:[0-9]+|<FILE>.ext:<N>|g
     # Relative file paths with extensions
     s|\b[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+\.[a-zA-Z]{1,4}\b|<PATH>|g
     # Generic numbers (5+ digits)
@@ -909,7 +1027,7 @@ _brain_shoelace_classify_risk() {
 _brain_shoelace_confidence() {
   local fix_id="$1" match_type="$2"
   local row
-  row=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+  row=$(_brain_shoelace_db "
     SELECT f.success_count, f.failure_count, f.last_success,
            e.project_fingerprint, e.command_type
     FROM fixes f
@@ -938,7 +1056,7 @@ _brain_shoelace_confidence() {
   local recency_factor=0
   if [[ -n "$last_success" ]]; then
     local days_since
-    days_since=$(sqlite3 "$_BRAIN_SHOELACE_DB" "
+    days_since=$(_brain_shoelace_db "
       SELECT CAST(julianday('now') - julianday('$last_success') AS INTEGER);
     " 2>/dev/null || echo "30")
     recency_factor=$(echo "scale=0; 20 * e(-$days_since / 30)" | bc -l 2>/dev/null || echo "10")
@@ -983,7 +1101,7 @@ _brain_shoelace_recall() {
 
   # Step 1: Exact signature match
   local exact
-  exact=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+  exact=$(_brain_shoelace_db "
     SELECT e.id, f.id, f.fix_text, f.success_count, f.failure_count, f.risk_level, e.seen_count
     FROM errors e
     JOIN fixes f ON f.error_id = e.id
@@ -1003,7 +1121,7 @@ _brain_shoelace_recall() {
 
   # Step 2: Fuzzy fallback — match on signature_fuzzy
   local fuzzy
-  fuzzy=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+  fuzzy=$(_brain_shoelace_db "
     SELECT e.id, f.id, f.fix_text, f.success_count, f.failure_count, f.risk_level, e.seen_count
     FROM errors e
     JOIN fixes f ON f.error_id = e.id
@@ -1028,14 +1146,14 @@ _brain_shoelace_recall() {
   tool_esc_recall=$(_brain_shoelace_esc_sql "$(_brain_shoelace_extract_toolchain "$_BRAIN_LAST_COMMAND" "$PWD")")
   cwd_esc_recall=$(_brain_shoelace_esc_sql "$PWD")
   fp_esc_recall=$(_brain_shoelace_esc_sql "$(_brain_shoelace_project_fingerprint "$PWD")")
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     INSERT INTO errors (signature, signature_fuzzy, error_text, error_normalized, exit_code, command, command_type, cwd, project_fingerprint)
     VALUES ('$sig_exact', '$sig_fuzzy', '$err_esc_recall', '$esc_norm', $_BRAIN_LAST_EXIT,
             '$cmd_esc_recall', '$tool_esc_recall',
             '$cwd_esc_recall', '$fp_esc_recall')
     ON CONFLICT(signature) DO UPDATE SET
       seen_count = seen_count + 1, last_seen = datetime('now');
-  " 2>/dev/null
+  "
 }
 
 # SQL-escape helper
@@ -1045,43 +1163,44 @@ _brain_shoelace_esc_sql() { printf '%s' "$1" | tr -d '\000' | sed "s/'/''/g"; }
 # State machine for tracking failure → fix → success cycles.
 # Prevents false positives by only recording when confidence is validated.
 _brain_shoelace_session_begin() {
+  [[ -n "${_BRAIN_SHOELACE_SESSION_ID:-}" ]] && return
   local error_id="${1:-}"
   _BRAIN_SHOELACE_SESSION_ID="${EPOCHSECONDS:-$(date +%s)}-$$-${RANDOM}"
   local cmd_esc=$(_brain_shoelace_esc_sql "$_BRAIN_LAST_COMMAND")
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     INSERT INTO learning_sessions (error_id, session_id, state, failure_command)
     VALUES (${error_id:-NULL}, '$_BRAIN_SHOELACE_SESSION_ID', 'failure', '$cmd_esc');
-  " 2>/dev/null
+  "
 }
 
 _brain_shoelace_session_mark_fix() {
   local fix_cmd="$1"
   [[ -z "${_BRAIN_SHOELACE_SESSION_ID:-}" ]] && return
   local esc=$(_brain_shoelace_esc_sql "$fix_cmd")
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     UPDATE learning_sessions
     SET state = 'fix_attempted', fix_command = '$esc', attempt_count = attempt_count + 1
     WHERE session_id = '$_BRAIN_SHOELACE_SESSION_ID' AND state = 'failure';
-  " 2>/dev/null
+  "
 }
 
 _brain_shoelace_session_resolve() {
   [[ -z "${_BRAIN_SHOELACE_SESSION_ID:-}" ]] && return
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     UPDATE learning_sessions
     SET state = 'resolved', resolved_at = datetime('now')
     WHERE session_id = '$_BRAIN_SHOELACE_SESSION_ID';
-  " 2>/dev/null
+  "
   unset _BRAIN_SHOELACE_SESSION_ID
 }
 
 _brain_shoelace_session_abandon() {
   [[ -z "${_BRAIN_SHOELACE_SESSION_ID:-}" ]] && return
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     UPDATE learning_sessions
     SET state = 'abandoned', resolved_at = datetime('now')
     WHERE session_id = '$_BRAIN_SHOELACE_SESSION_ID';
-  " 2>/dev/null
+  "
   unset _BRAIN_SHOELACE_SESSION_ID
 }
 
@@ -1094,7 +1213,7 @@ _brain_shoelace_session_abandon() {
 _brain_shoelace_learn() {
   local error_text="$1" fix_text="$2" exit_code="${3:-}"
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   [[ -z "$error_text" || -z "$fix_text" ]] && { echo "  ✗ Error and fix text required"; return; }
 
   local norm_exact norm_fuzzy
@@ -1114,35 +1233,40 @@ _brain_shoelace_learn() {
   local proj_fp=$(_brain_shoelace_project_fingerprint "$PWD")
   local risk=$(_brain_shoelace_classify_risk "$fix_text")
 
+  # Begin session for this learn (no-op if already started by interactive flow)
+  _brain_shoelace_session_begin
+
   # Insert or update error record
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     INSERT INTO errors (signature, signature_fuzzy, error_text, error_normalized, exit_code, command, command_type, cwd, project_fingerprint)
     VALUES ('$sig_exact', '$sig_fuzzy', '$err_esc', '$norm_esc', ${exit_code:-NULL}, '$cmd_esc', '$tool_esc', '$cwd_esc', '$proj_fp')
     ON CONFLICT(signature) DO UPDATE SET
       seen_count = seen_count + 1, last_seen = datetime('now'),
       command = CASE WHEN excluded.command != '' THEN excluded.command ELSE command END,
       cwd = excluded.cwd;
-  " 2>/dev/null
+  "
 
   local error_id
-  error_id=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT id FROM errors WHERE signature = '$sig_exact';" 2>/dev/null)
+  error_id=$(_brain_shoelace_db "SELECT id FROM errors WHERE signature = '$sig_exact';" 2>/dev/null)
   [[ -z "$error_id" ]] && { echo "  ✗ Failed to save error record"; return; }
 
   # Insert fix
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  if _brain_shoelace_db_write "
     INSERT INTO fixes (error_id, fix_text, fix_command, risk_level)
     VALUES ($error_id, '$fix_esc', '$cmd_esc', '$risk');
-  " 2>/dev/null && {
+  "; then
     echo "  ✓ Saved to Shoelace (risk: $risk)"
     # Record telemetry
-    sqlite3 "$_BRAIN_SHOELACE_DB" "
+    _brain_shoelace_db_write "
       INSERT INTO telemetry (event_type, error_id, decision)
       VALUES ('learn', $error_id, 'saved');
-    " 2>/dev/null
+    "
     # Mark session resolved
     _brain_shoelace_session_mark_fix "$fix_text"
     _brain_shoelace_session_resolve
-  } || echo "  ✗ Failed to save fix"
+  else
+    echo "  ✗ Failed to save fix"
+  fi
 }
 
 # ── Suggest: Display ranked fix recommendations ──────────────────────────
@@ -1236,30 +1360,41 @@ _brain_shoelace_apply_by_id() {
   echo "  Running: $fix_text"
   _brain_shoelace_session_mark_fix "$fix_text"
 
-  # Execute with timing
+  # Execute with timing — safe argv-based execution (NO eval, NO shell expansion)
+  # Parse fix_text into argv using zsh's (z) tokenizer, which handles quotes
+  # but does NOT expand $(), ``, or variables — preventing command injection.
   local start_time=$EPOCHREALTIME
-  eval "$fix_text"
+  local -a cmd_args
+  cmd_args=("${(z)fix_text}")
+  if [[ ${#cmd_args} -eq 0 ]]; then
+    echo "  ${_BRAIN_RED}✗ Empty fix command${_BRAIN_RESET}"
+    return
+  fi
+  "${cmd_args[@]}"
   local exec_exit=$?
   local end_time=$EPOCHREALTIME
-  local duration_ms=$(( (${end_time%.*} - ${start_time%.*}) * 1000 + (${end_time#*.} - ${start_time#*.}) / 1000 ))
+  # Force decimal arithmetic: use 10#$var to prevent octal interpretation of leading zeros
+  local start_int="${start_time%.*}" start_frac="10#${start_time#*.}"
+  local end_int="${end_time%.*}" end_frac="10#${end_time#*.}"
+  local duration_ms=$(( (end_int - start_int) * 1000 + (end_frac - start_frac) / 1000 ))
   [[ $duration_ms -lt 0 ]] && duration_ms=0
 
   if [[ $exec_exit -eq 0 ]]; then
     echo "  ${_BRAIN_GREEN}✓ Fix succeeded${_BRAIN_RESET}"
-    sqlite3 "$_BRAIN_SHOELACE_DB" "
+    _brain_shoelace_db_write "
       UPDATE fixes SET success_count = success_count + 1, last_success = datetime('now'), updated_at = datetime('now')
       WHERE id = '$fix_id';
-    " 2>/dev/null
-    sqlite3 "$_BRAIN_SHOELACE_DB" "
+    "
+    _brain_shoelace_db_write "
       INSERT INTO telemetry (event_type, fix_id, decision, duration_ms)
       VALUES ('apply', '$fix_id', 'success', $duration_ms);
-    " 2>/dev/null
+    "
   else
     echo "  ${_BRAIN_RED}✗ Fix failed (exit $exec_exit)${_BRAIN_RESET}"
-    sqlite3 "$_BRAIN_SHOELACE_DB" "
+    _brain_shoelace_db_write "
       UPDATE fixes SET failure_count = failure_count + 1, last_failure = datetime('now'), updated_at = datetime('now')
       WHERE id = '$fix_id';
-    " 2>/dev/null
+    "
   fi
 }
 
@@ -1279,7 +1414,7 @@ _brain_shoelace_why() {
   local error_text="${1:-${_BRAIN_LAST_STDERR:-}}"
   [[ -z "$error_text" ]] && { echo "  No error to analyze. Run a failing command first."; return; }
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   _brain_interface_load
 
   local recalls
@@ -1300,7 +1435,7 @@ _brain_shoelace_why() {
     echo "  ${_BRAIN_DIM}Fuzzy signature:${_BRAIN_RESET}  ${sig_fuzzy:0:16}..."
     echo ""
     local db_count
-    db_count=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT COUNT(*) FROM errors;" 2>/dev/null)
+    db_count=$(_brain_shoelace_db "SELECT COUNT(*) FROM errors;" 2>/dev/null)
     echo "  ${_BRAIN_DIM}Errors in DB:${_BRAIN_RESET} $db_count"
     echo ""
     echo "  Use: brain shoelace learn <fix command>"
@@ -1322,7 +1457,7 @@ _brain_shoelace_why() {
     [[ "$match_type" == "fuzzy" ]] && echo "  ${_BRAIN_DIM}~${_BRAIN_RESET} signature similarity: fuzzy match"
     echo "  ${_BRAIN_GREEN}✓${_BRAIN_RESET} same error signature"
     local row
-    row=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+    row=$(_brain_shoelace_db "
       SELECT e.project_fingerprint, e.command_type, e.cwd
       FROM fixes f JOIN errors e ON e.id = f.error_id WHERE f.id = '$fix_id';
     " 2>/dev/null)
@@ -1344,11 +1479,11 @@ _brain_shoelace_why() {
 # ── Stats: Analytics dashboard ────────────────────────────────────────────
 _brain_shoelace_stats() {
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   _brain_interface_load
   _brain_interface_header "SHOELACE STATS"
   local counts
-  counts=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+  counts=$(_brain_shoelace_db "
     SELECT
       (SELECT COUNT(*) FROM errors),
       (SELECT COUNT(*) FROM fixes),
@@ -1374,7 +1509,7 @@ _brain_shoelace_stats() {
     fi
     echo ""
     echo "  ${_BRAIN_DIM}Top ecosystems:${_BRAIN_RESET}"
-    sqlite3 "$_BRAIN_SHOELACE_DB" "
+    _brain_shoelace_db "
       SELECT command_type, COUNT(*) as c FROM errors
       WHERE command_type != 'unknown' GROUP BY command_type
       ORDER BY c DESC LIMIT 5;
@@ -1388,11 +1523,11 @@ _brain_shoelace_stats() {
 # ── List: Browse recent error records ─────────────────────────────────────
 _brain_shoelace_list() {
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   _brain_interface_load
   _brain_interface_header "SHOELACE MEMORY"
   local rows
-  rows=$(sqlite3 -separator '|' "$_BRAIN_SHOELACE_DB" "
+  rows=$(_brain_shoelace_db "
     SELECT e.id, e.seen_count,
            replace(substr(coalesce(e.error_text, ''), 1, 60), char(10), ' '),
            coalesce(f.success_count, 0), coalesce(f.failure_count, 0),
@@ -1419,34 +1554,39 @@ _brain_shoelace_list() {
 # ── Forget: Remove a specific error record ────────────────────────────────
 _brain_shoelace_forget() {
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   local id="$1"
   if [[ -z "$id" ]]; then
     echo "  Usage: brain shoelace forget <id>"
     echo "  Find IDs with: brain shoelace list"
     return
   fi
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  # Validate ID is numeric to prevent SQL injection
+  if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+    echo "  ✗ Invalid ID: must be numeric"
+    return
+  fi
+  _brain_shoelace_db_write "
     DELETE FROM fixes WHERE error_id = $id;
     DELETE FROM learning_sessions WHERE error_id = $id;
     DELETE FROM telemetry WHERE error_id = $id;
     DELETE FROM errors WHERE id = $id;
-  " 2>/dev/null && echo "  ✓ Removed #$id" || echo "  ✗ Not found"
+  " && echo "  ✓ Removed #$id" || echo "  ✗ Not found"
 }
 
 # ── Clear: Wipe all data ──────────────────────────────────────────────────
 _brain_shoelace_clear() {
   _brain_shoelace_load
-  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ sqlite3 not available"; return; }
+  [[ $_BRAIN_SHOELACE_AVAIL -eq 0 ]] && { echo "  ✗ ${_BRAIN_SHOELACE_ERR:-Shoelace unavailable (run: brain doctor)}"; return; }
   echo -n "  Clear all Shoelace data? [y/N] "
   local resp; read -r resp
   [[ "$resp" != "y" && "$resp" != "Y" ]] && { echo "  Cancelled"; return; }
-  sqlite3 "$_BRAIN_SHOELACE_DB" "
+  _brain_shoelace_db_write "
     DELETE FROM fixes;
     DELETE FROM errors;
     DELETE FROM learning_sessions;
     DELETE FROM telemetry;
-  " 2>/dev/null && echo "  ✓ All Shoelace data cleared" || echo "  ✗ Failed"
+  " && echo "  ✓ All Shoelace data cleared" || echo "  ✗ Failed"
 }
 
 # ── Dispatcher ────────────────────────────────────────────────────────────
@@ -1724,9 +1864,9 @@ _brain_doctor() {
     _brain_shoelace_load 2>/dev/null
     if _brain_has sqlite3 && [[ -f "${_BRAIN_SHOELACE_DB:-}" ]]; then
       local sc sf sr
-      sc=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT COUNT(*) FROM errors;" 2>/dev/null)
-      sf=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT COUNT(*) FROM fixes;" 2>/dev/null)
-      sr=$(sqlite3 "$_BRAIN_SHOELACE_DB" "SELECT COUNT(*) FROM learning_sessions WHERE state='resolved';" 2>/dev/null)
+      sc=$(_brain_shoelace_db "SELECT COUNT(*) FROM errors;" 2>/dev/null || echo 0)
+      sf=$(_brain_shoelace_db "SELECT COUNT(*) FROM fixes;" 2>/dev/null || echo 0)
+      sr=$(_brain_shoelace_db "SELECT COUNT(*) FROM learning_sessions WHERE state='resolved';" 2>/dev/null || echo 0)
       printf "  %-16s %s errors, %s fixes, %s sessions resolved\n" "Memory" "${sc:-0}" "${sf:-0}" "${sr:-0}"
       printf "  %-16s %s\n" "DB" "$_BRAIN_SHOELACE_DB"
     else
